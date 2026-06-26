@@ -1,10 +1,10 @@
 import {
   createFileRoute,
   Outlet,
-  redirect,
   useNavigate,
   useLocation,
 } from "@tanstack/react-router";
+
 import { useEffect, useState } from "react";
 import { AdminSidebar } from "@/components/admin/AdminSidebar";
 import { useAppStore, hasLocalAuthSession } from "@/stores/app-store";
@@ -20,17 +20,10 @@ import { withTimeout } from "@/lib/async-timeout";
 
 export const Route = createFileRoute("/admin")({
   // Admin session lives in localStorage (Supabase). SSR-skip + a
-  // synchronous beforeLoad gate prevents admin chrome from being
-  // streamed to anonymous visitors. Server-verified role check still
-  // runs inside <AdminGate /> against `user_roles`.
+  // component-level gate (post-mount) prevents admin chrome from being
+  // shown to anonymous visitors AND avoids a hydration mismatch from
+  // synchronously redirecting during hydration.
   ssr: false,
-  beforeLoad: ({ location }) => {
-    if (typeof window === "undefined") return;
-    if (location.pathname === "/admin/login") return; // public sub-route
-    if (!hasLocalAuthSession()) {
-      throw redirect({ to: "/admin/login" });
-    }
-  },
   component: AdminLayout,
   head: () => ({
     meta: [
@@ -44,6 +37,7 @@ export const Route = createFileRoute("/admin")({
     ],
   }),
 });
+
 
 const ADMIN_VERIFIED_KEY = "admin-verified-at";
 const ADMIN_VERIFIED_TTL_MS = 60_000;
@@ -255,6 +249,25 @@ function AdminGate({ children }: { children: React.ReactNode }) {
 
 function AdminLayout() {
   const path = useLocation({ select: (l) => l.pathname });
+  const navigate = useNavigate();
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  // Deferred anon-visitor redirect. Avoids hydration mismatch from a
+  // synchronous beforeLoad redirect.
+  useEffect(() => {
+    if (!mounted) return;
+    if (path === "/admin/login") return;
+    if (!hasLocalAuthSession()) {
+      navigate({ to: "/admin/login", replace: true });
+    }
+  }, [mounted, path, navigate]);
+
+  // First client paint matches SSR (empty).
+  if (!mounted) return null;
 
   // The admin login page lives at /admin/login but must be publicly reachable
   // (no sidebar, no gate) so unauthenticated admins can sign in.
@@ -267,17 +280,17 @@ function AdminLayout() {
     );
   }
 
-  // H-4: AdminSidebar must NOT render until `verifyAdminAccess` confirms.
-  // Previously it was a sibling of <AdminGate/> and therefore visible to
-  // anyone hitting /admin (revealing the admin nav structure). It now
-  // lives inside the gate, so non-admins see only the gate's loading /
-  // forbidden / demo card.
+  // Anonymous visitor: the effect above is navigating to /admin/login.
+  // Render null in the meantime so we don't flash admin chrome.
+  if (!hasLocalAuthSession()) return null;
+
   return (
     <div className="relative min-h-dvh overflow-x-hidden bg-background text-foreground">
       <div className="pointer-events-none fixed inset-0 -z-10 bg-hero-glow opacity-60" />
       <div className="pointer-events-none fixed left-10 top-20 -z-10 h-72 w-72 rounded-full bg-[var(--neon-purple)]/20 blur-3xl animate-pulse-glow" />
       <div className="pointer-events-none fixed right-10 bottom-10 -z-10 h-80 w-80 rounded-full bg-[var(--neon-blue)]/20 blur-3xl animate-pulse-glow" />
       <div className="pointer-events-none fixed left-1/2 top-1/3 -z-10 h-64 w-64 rounded-full bg-fuchsia-500/10 blur-3xl animate-pulse-glow" />
+
 
       <div className="mx-auto flex max-w-[1600px] gap-4 px-4 py-4 sm:px-6">
         <AdminGate>
