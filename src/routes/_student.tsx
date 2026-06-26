@@ -1,0 +1,161 @@
+import { createFileRoute, Outlet, redirect, useNavigate, useRouter } from "@tanstack/react-router";
+import { useEffect } from "react";
+
+import { DashSidebar } from "@/components/dashboard/DashSidebar";
+import { DashTopbar } from "@/components/dashboard/DashTopbar";
+import { StudyHeartbeat } from "@/components/tracking/StudyHeartbeat";
+import { NoticeBanner } from "@/components/site/NoticeBanner";
+import { useAppStore, hasLocalAuthSession } from "@/stores/app-store";
+import { supabase } from "@/integrations/supabase/client";
+import { reportError } from "@/lib/error-reporter";
+import { withTimeout } from "@/lib/async-timeout";
+
+const STUDENT_GUARD_TIMEOUT_MS = 8_000;
+
+export const Route = createFileRoute("/_student")({
+  // Supabase session lives in localStorage; SSR cannot read it, so render
+  // the protected subtree client-only. The synchronous beforeLoad gate
+  // gives SSR-safe, no-flash protection before any child renders.
+  ssr: false,
+  beforeLoad: async ({ location }) => {
+    if (typeof window === "undefined") return;
+    if (!hasLocalAuthSession()) {
+      throw redirect({ to: "/login", search: { redirect: location.href } });
+    }
+    const { data: userData, error: userError } = await withTimeout(
+      supabase.auth.getUser(),
+      STUDENT_GUARD_TIMEOUT_MS,
+      "Student session verification timed out",
+    );
+    if (userError || !userData.user) {
+      await supabase.auth.signOut().catch(() => undefined);
+      throw redirect({ to: "/login", search: { redirect: location.href } });
+    }
+    const uid = userData.user.id;
+    const [{ data: profile }, { data: banned }] = await withTimeout(
+      Promise.all([
+        supabase.from("profiles").select("id,deleted_at,status").eq("id", uid).maybeSingle(),
+        (supabase as unknown as {
+          rpc: (n: string, a: Record<string, unknown>) => Promise<{ data: boolean | null }>;
+        }).rpc("is_user_banned", { _user_id: uid }),
+      ]),
+      STUDENT_GUARD_TIMEOUT_MS,
+      "Student account status verification timed out",
+    );
+    // New signups may not have a `profiles` row yet (created async by trigger).
+    // Treat missing profile as benign — gate only on an explicit
+    // deleted/suspended row or a true ban. Prevents post-signup bounces to
+    // /login that previously required a manual page refresh.
+    if (
+      (profile &&
+        (profile.deleted_at ||
+          ["suspended", "deleted", "banned"].includes(profile.status ?? ""))) ||
+      banned === true
+    ) {
+      await supabase.auth.signOut().catch(() => undefined);
+      throw redirect({ to: "/login", search: { redirect: location.href } });
+    }
+  },
+  component: StudentLayout,
+  errorComponent: StudentErrorComponent,
+});
+
+function StudentErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
+  const router = useRouter();
+  useEffect(() => {
+    // Log render/loader/query failures so we can triage them later.
+    // eslint-disable-next-line no-console
+    console.error("[student] route error", error);
+    reportError({
+      source: "frontend",
+      severity: "high",
+      message: error.message || "Student route failure",
+      stack: error.stack,
+    });
+  }, [error]);
+
+  return (
+    <div className="flex min-h-dvh items-center justify-center bg-background px-4">
+      <div className="max-w-md text-center">
+        <h1 className="text-xl font-semibold tracking-tight text-foreground">
+          Something went wrong
+        </h1>
+        <p className="mt-2 text-sm text-muted-foreground">
+          We hit a problem loading this section. You can try again or head back to your dashboard.
+        </p>
+        <div className="mt-6 flex flex-wrap justify-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              router.invalidate();
+              reset();
+            }}
+            className="inline-flex min-h-11 items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+          >
+            Try again
+          </button>
+          <a
+            href="/dashboard"
+            className="inline-flex min-h-11 items-center justify-center rounded-md border border-input bg-background px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent"
+          >
+            Go to dashboard
+          </a>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StudentGate({ children }: { children: React.ReactNode }) {
+  const user = useAppStore((s) => s.user);
+  const sessionReady = useAppStore((s) => s.sessionReady);
+  const authLoading = useAppStore((s) => s.authLoading);
+  const navigate = useNavigate();
+
+  // Instant navigation: never block rendering on auth/profile fetches.
+  // The synchronous beforeLoad gate above already short-circuits
+  // unauthenticated visits via localStorage. Role checks run silently
+  // in the background; if the user turns out to not be a student we
+  // redirect without ever showing a loading or denied screen.
+  useEffect(() => {
+    if (!sessionReady || authLoading) return;
+    if (!user) {
+      navigate({ to: "/login", replace: true });
+      return;
+    }
+    if (user.role !== "student") {
+      const adminLike = user.role === "admin" || user.role === "super_admin" || user.role === "moderator";
+      navigate({ to: adminLike ? "/admin" : "/login", replace: true });
+    }
+  }, [sessionReady, authLoading, user, navigate]);
+
+  return <>{children}</>;
+}
+
+function StudentLayout() {
+  return (
+    <div className="relative min-h-dvh overflow-x-hidden bg-background text-foreground">
+      <div className="pointer-events-none fixed inset-0 -z-10 bg-hero-glow opacity-60" />
+      <div className="pointer-events-none fixed left-10 top-20 -z-10 h-72 w-72 rounded-full bg-[var(--neon-purple)]/20 blur-3xl animate-pulse-glow" />
+      <div className="pointer-events-none fixed right-10 bottom-10 -z-10 h-80 w-80 rounded-full bg-[var(--neon-blue)]/20 blur-3xl animate-pulse-glow" />
+      <div className="pointer-events-none fixed left-1/2 top-1/3 -z-10 h-64 w-64 rounded-full bg-fuchsia-500/10 blur-3xl animate-pulse-glow" />
+
+      {/* H-2 fix: sidebar + topbar moved INSIDE StudentGate so an
+          unauthenticated visitor hitting a /dashboard URL doesn't see the
+          authenticated chrome (nav items, branded topbar) before the
+          redirect fires. */}
+      <div className="mx-auto flex max-w-[1500px] gap-4 px-4 py-4 sm:px-6">
+        <StudentGate>
+          <DashSidebar />
+          <div className="pointer-events-auto min-w-0 flex-1 space-y-4">
+            <DashTopbar />
+            <NoticeBanner />
+            <StudyHeartbeat />
+            <Outlet />
+          </div>
+        </StudentGate>
+      </div>
+    </div>
+  );
+}
+
