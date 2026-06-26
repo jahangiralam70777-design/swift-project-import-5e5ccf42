@@ -4,12 +4,20 @@ import { AlertTriangle, Loader2 } from "lucide-react";
 import { withTimeout } from "@/lib/async-timeout";
 
 export function DefaultPendingFallback() {
+  // Render nothing during SSR / pre-hydration so that the markup the server
+  // streams matches what the client renders on its first pass. Once we're
+  // mounted on the client (navigation pending), show the spinner with a
+  // timeout escape hatch.
+  const [mounted, setMounted] = useState(false);
   const [timedOut, setTimedOut] = useState(false);
 
   useEffect(() => {
+    setMounted(true);
     const id = window.setTimeout(() => setTimedOut(true), 12_000);
     return () => window.clearTimeout(id);
   }, []);
+
+  if (!mounted) return null;
 
   if (timedOut) {
     return (
@@ -46,6 +54,7 @@ export function DefaultPendingFallback() {
     </div>
   );
 }
+
 
 export function DefaultNotFoundFallback() {
   return (
